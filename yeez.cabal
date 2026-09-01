@@ -20,7 +20,9 @@ library
     import:           warnings
     hs-source-dirs:   src
     exposed-modules:  S3.Client
+                      Config
                       UI.Types
+                      UI.Connect
                       UI.App
     build-depends:    base             >=4.14 && <5
                     , amazonka         >=2.0  && <3
