@@ -22,43 +22,57 @@ import qualified Data.Text as T
 import qualified Data.Text.Zipper as Z
 import qualified Data.Vector as V
 import qualified Graphics.Vty as Vty
+import Config (listProfiles)
 import S3.Client
 import System.Directory
   ( doesDirectoryExist
   , getHomeDirectory
   )
-import System.Exit (exitFailure)
+import System.Exit (exitSuccess)
 import System.FilePath ((</>), takeFileName)
-import System.IO (hPutStrLn, stderr)
+import UI.Connect (connect)
 import UI.Types
 
 -- ---------------------------------------------------------------------------
 -- Entry point
 -- ---------------------------------------------------------------------------
 
--- | Build the AWS environment, fetch the bucket list and run the TUI.
+-- | Establish a connection, then fetch the bucket list and run the TUI.
+--
+-- If the ambient credential chain already works and there are no named
+-- profiles to choose between, yeez connects silently and drops straight
+-- into the bucket list (the historical zero-config behaviour). Otherwise it
+-- shows the setup wizard so the user can pick a profile, enter credentials,
+-- or point at an S3-compatible endpoint.
 runApp :: IO ()
 runApp = do
-  envOrErr <- try newAwsEnv
-  case envOrErr of
-    Left (e :: SomeException) -> do
-      hPutStrLn stderr ("yeez: could not initialise AWS credentials:\n" <> displayException e)
-      exitFailure
-    Right env -> do
-      bucketsOrErr <- try (listAllBuckets env)
-      let st0 = initialState env
-          st = case bucketsOrErr of
-            Left (e :: SomeException) ->
-              st0
-                { stStatus = "error listing buckets: " <> oneLine e
-                , stScreen = ScreenMessage ScreenBuckets
-                }
-            Right bs ->
-              st0
-                { stBuckets = L.listReplace (V.fromList bs) (initialSel bs) (stBuckets st0)
-                , stStatus = countLabel (length bs) "bucket"
-                }
-      void (defaultMain app st)
+  profiles <- listProfiles
+  disc <- try newAwsEnv :: IO (Either SomeException Env)
+  case (disc, profiles) of
+    (Right env, []) -> runMain env
+    _ -> do
+      mEnv <- connect (either (const Nothing) Just disc) profiles
+      case mEnv of
+        Nothing -> exitSuccess
+        Just env -> runMain env
+
+-- | Load the bucket list into a fresh state and run the main app.
+runMain :: Env -> IO ()
+runMain env = do
+  bucketsOrErr <- try (listAllBuckets env)
+  let st0 = initialState env
+      st = case bucketsOrErr of
+        Left (e :: SomeException) ->
+          st0
+            { stStatus = "error listing buckets: " <> oneLine e
+            , stScreen = ScreenMessage ScreenBuckets
+            }
+        Right bs ->
+          st0
+            { stBuckets = L.listReplace (V.fromList bs) (initialSel bs) (stBuckets st0)
+            , stStatus = countLabel (length bs) "bucket"
+            }
+  void (defaultMain app st)
 
 initialState :: Env -> AppState
 initialState env =
