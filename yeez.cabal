@@ -1,0 +1,48 @@
+cabal-version:      2.4
+name:               yeez
+version:            0.1.0.0
+synopsis:           Terminal UI for S3 object CRUD
+description:
+  yeez is a terminal user interface for browsing S3 buckets and performing
+  object-level CRUD (upload, download, rename, delete, create folder) using
+  the native Haskell AWS SDK (amazonka) and the brick TUI framework.
+license:            BSD-3-Clause
+author:             yeez contributors
+maintainer:         jcerdas@ignify.ee
+category:           Network
+build-type:         Simple
+extra-doc-files:    README.md
+
+common warnings
+    ghc-options: -Wall -Wcompat
+
+library
+    import:           warnings
+    hs-source-dirs:   src
+    exposed-modules:  S3.Client
+                      UI.Types
+                      UI.App
+    build-depends:    base             >=4.14 && <5
+                    , amazonka         >=2.0  && <3
+                    , amazonka-s3      >=2.0  && <3
+                    , brick            >=2.0  && <3
+                    , bytestring
+                    , conduit
+                    , directory
+                    , filepath
+                    , microlens
+                    , resourcet
+                    , text
+                    , text-zipper
+                    , vector
+                    , vty              >=6.0  && <7
+    default-language: Haskell2010
+
+executable yeez
+    import:           warnings
+    hs-source-dirs:   app
+    main-is:          Main.hs
+    build-depends:    base >=4.14 && <5
+                    , yeez
+    ghc-options:      -threaded
+    default-language: Haskell2010
