@@ -11,7 +11,9 @@
 -- (@amazonka-2.0@ / @amazonka-s3-2.0@); on a different resolution you may
 -- need small accessor renames, all of which are confined to this file.
 module S3.Client
-  ( newAwsEnv
+  ( ConnParams (..)
+  , newAwsEnv
+  , newAwsEnvFromParams
   , listAllBuckets
   , listObjectsUnder
   , uploadFile
@@ -23,24 +25,80 @@ module S3.Client
 
 import qualified Amazonka as AWS
 import Amazonka (Env)
+import qualified Amazonka.Auth as Auth
 import qualified Amazonka.S3 as S3
 import qualified Amazonka.S3.Lens as S3L
 import Control.Monad (void)
 import Control.Monad.Trans.Resource (runResourceT)
 import qualified Data.ByteString as BS
+import Data.ByteString (ByteString)
 import qualified Data.Conduit as C
 import qualified Data.Conduit.Combinators as CC
 import Data.Char (ord)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
+import Data.Text.Encoding (encodeUtf8)
 import Lens.Micro ((&), (.~), (^.))
 import Numeric (showHex)
+import Text.Read (readMaybe)
+
+-- | Explicit connection settings collected by the setup wizard.
+--
+-- 'cpEndpoint', when set, points yeez at a non-AWS, S3-compatible service
+-- (MinIO, Cloudflare R2, DigitalOcean Spaces, …). Setting it also flips the
+-- addressing style to path-style, which those services generally require.
+data ConnParams = ConnParams
+  { cpAccessKey :: Text
+    -- ^ AWS access key id.
+  , cpSecretKey :: Text
+    -- ^ AWS secret access key.
+  , cpRegion :: Text
+    -- ^ Region, e.g. @\"us-east-1\"@.
+  , cpEndpoint :: Maybe Text
+    -- ^ Optional endpoint URL, e.g. @\"https:\/\/minio.example.com:9000\"@.
+  } deriving (Eq, Show)
 
 -- | Build an AWS environment using the standard credential chain:
 -- environment variables, @~\/.aws\/credentials@, container/instance role.
 newAwsEnv :: IO Env
 newAwsEnv = AWS.newEnv AWS.discover
+
+-- | Build an AWS environment from explicit 'ConnParams': static keys, an
+-- overridden region and, optionally, a custom S3 endpoint with path-style
+-- addressing.
+newAwsEnvFromParams :: ConnParams -> IO Env
+newAwsEnvFromParams cp = do
+  base <-
+    AWS.newEnv
+      ( pure
+          . Auth.fromKeys
+              (AWS.AccessKey (encodeUtf8 (cpAccessKey cp)))
+              (AWS.SecretKey (encodeUtf8 (cpSecretKey cp)))
+      )
+  let regioned = base { AWS.region = AWS.Region' (cpRegion cp) }
+  pure $ case cpEndpoint cp of
+    Nothing -> regioned
+    Just url ->
+      let (secure, host, port) = parseEndpoint url
+       in AWS.overrideService (pathStyle . AWS.setEndpoint secure host port) regioned
+  where
+    pathStyle svc = svc { AWS.s3AddressingStyle = AWS.S3AddressingStylePath }
+
+-- | Split an endpoint URL into @(secure, host, port)@ for 'AWS.setEndpoint'.
+-- Defaults to HTTPS on 443 (or HTTP on 80) when the scheme or port is absent.
+parseEndpoint :: Text -> (Bool, ByteString, Int)
+parseEndpoint url =
+  let (scheme, afterScheme) = case T.breakOn "://" url of
+        (s, r) | not (T.null r) -> (s, T.drop 3 r)
+        _ -> ("https", url)
+      secure = scheme /= "http"
+      hostPort = T.takeWhile (/= '/') afterScheme
+      (host, portPart) = T.break (== ':') hostPort
+      port = case T.stripPrefix ":" portPart >>= (readMaybe . T.unpack) of
+        Just n -> n
+        Nothing -> if secure then 443 else 80
+   in (secure, encodeUtf8 host, port)
 
 -- | All buckets visible to the caller (@ListBuckets@).
 listAllBuckets :: Env -> IO [Text]
