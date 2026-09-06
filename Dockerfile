@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # ---------------------------------------------------------------------------
 # Build stage: compile the yeez binary against amazonka + brick.
 # ---------------------------------------------------------------------------
@@ -8,15 +9,16 @@ FROM haskell:9.4.8 AS build
 # Debian buster, whose apt repos are archived — avoid touching apt.)
 WORKDIR /app
 
-# Refresh the package index, then resolve and build dependencies first so
-# this expensive layer is cached across source-only changes.
-RUN cabal update
-COPY yeez.cabal ./
-RUN cabal build --only-dependencies exe:yeez
-
-# Now build the app itself and stage the binary at a known path.
 COPY . .
-RUN cabal build exe:yeez \
+
+# Build the executable. The cache mounts keep the Hackage index and the
+# compiled dependency store (amazonka is large) across rebuilds, so only
+# changed local modules recompile. `dist-newstyle` is a cache mount too, so
+# the binary is copied to /out within this same RUN while the mount is live.
+RUN --mount=type=cache,target=/root/.cabal \
+    --mount=type=cache,target=/app/dist-newstyle \
+    cabal update \
+    && cabal build exe:yeez \
     && mkdir -p /out \
     && cp "$(cabal list-bin exe:yeez)" /out/yeez
 
