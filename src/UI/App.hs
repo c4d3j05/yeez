@@ -49,18 +49,18 @@ runApp = do
   profiles <- listProfiles
   disc <- try newAwsEnv :: IO (Either SomeException Env)
   case (disc, profiles) of
-    (Right env, []) -> runMain env
+    (Right env, []) -> runMain [Conn "detected" env]
     _ -> do
-      mEnv <- connect (either (const Nothing) Just disc) profiles
-      case mEnv of
+      mConn <- connect (either (const Nothing) Just disc) profiles
+      case mConn of
         Nothing -> exitSuccess
-        Just env -> runMain env
+        Just (label, env) -> runMain [Conn label env]
 
 -- | Load the bucket list into a fresh state and run the main app.
-runMain :: Env -> IO ()
-runMain env = do
-  bucketsOrErr <- try (listAllBuckets env)
-  let st0 = initialState env
+runMain :: [Conn] -> IO ()
+runMain conns = do
+  bucketsOrErr <- try (listAllBuckets (connEnv (head conns)))
+  let st0 = initialState conns
       st = case bucketsOrErr of
         Left (e :: SomeException) ->
           st0
@@ -74,10 +74,12 @@ runMain env = do
             }
   void (defaultMain app st)
 
-initialState :: Env -> AppState
-initialState env =
+initialState :: [Conn] -> AppState
+initialState conns =
   AppState
-    { stEnv = env
+    { stConns = conns
+    , stConnIx = 0
+    , stConnList = L.list ConnListW V.empty 1
     , stBuckets = L.list BucketListW V.empty 1
     , stObjects = L.list ObjectListW V.empty 1
     , stBucket = Nothing
@@ -114,6 +116,11 @@ drawUI st = case stScreen st of
   ScreenPrompt act -> [promptOverlay st act, backdrop st ScreenObjects]
   ScreenConfirmDelete -> [confirmOverlay st, backdrop st ScreenObjects]
   ScreenMessage back -> [messageOverlay st, backdrop st back]
+  ScreenConnections ->
+    [ connectionsOverlay st
+    , backdrop st (if stBucket st == Nothing then ScreenBuckets else ScreenObjects)
+    ]
+  ScreenHelp back -> [helpOverlay, backdrop st back]
 
 -- | The full-screen layer drawn underneath an overlay.
 backdrop :: AppState -> Screen -> Widget Name
@@ -121,8 +128,19 @@ backdrop st = \case
   ScreenBuckets -> bucketsScreen st
   _ -> if stBucket st == Nothing then bucketsScreen st else objectsScreen st
 
-header :: Text -> Widget Name
-header t = withAttr titleAttr (padRight Max (txt (" " <> t)))
+-- | The title bar: a label on the left and the active connection's name on
+-- the right, so which account/endpoint you are browsing is always visible.
+header :: AppState -> Text -> Widget Name
+header st t =
+  withAttr titleAttr $
+    hBox
+      [ txt (" " <> t)
+      , padLeft Max (txt ("[" <> activeLabel st <> "] "))
+      ]
+
+-- | The label of the currently active connection.
+activeLabel :: AppState -> Text
+activeLabel st = maybe "?" connLabel (safeIx (stConns st) (stConnIx st))
 
 footer :: AppState -> Text -> Widget Name
 footer st keys =
@@ -134,11 +152,11 @@ footer st keys =
 bucketsScreen :: AppState -> Widget Name
 bucketsScreen st =
   vBox
-    [ header "yeez — buckets"
+    [ header st "yeez — buckets"
     , B.hBorder
     , L.renderList renderBucket True (stBuckets st)
     , B.hBorder
-    , footer st "↑/↓ move · enter open · r refresh · q quit"
+    , footer st "↑/↓ move · enter open · r refresh · c connections · ? all commands · esc/q quit"
     ]
 
 renderBucket :: Bool -> Text -> Widget Name
@@ -147,11 +165,11 @@ renderBucket _ b = padRight Max (txt ("  " <> b))
 objectsScreen :: AppState -> Widget Name
 objectsScreen st =
   vBox
-    [ header ("yeez — s3://" <> fromMaybe "" (stBucket st) <> "/" <> stPrefix st)
+    [ header st ("yeez — s3://" <> fromMaybe "" (stBucket st) <> "/" <> stPrefix st)
     , B.hBorder
     , L.renderList renderObject True (stObjects st)
     , B.hBorder
-    , footer st "enter open · esc/h up · u upload · d download · n new folder · R rename · x delete · r refresh · q quit"
+    , footer st "↑/↓ move · enter open · esc/h back · u upload file · d download · n new folder · R rename · x delete · r refresh · c connections · ? all commands · q quit"
     ]
 
 renderObject :: Bool -> ObjectRow -> Widget Name
@@ -194,6 +212,55 @@ messageOverlay st =
       , withAttr helpAttr (txt "press any key to continue")
       ]
 
+connectionsOverlay :: AppState -> Widget Name
+connectionsOverlay st =
+  overlay "Connections" $
+    vBox
+      [ vLimit (length (stConns st) + 1)
+          (L.renderList (renderConnRow st) True (stConnList st))
+      , withAttr helpAttr (txt "enter switch · a add · esc close")
+      ]
+
+renderConnRow :: AppState -> Bool -> Maybe Int -> Widget Name
+renderConnRow st _ = \case
+  Nothing -> withAttr folderAttr (padRight Max (txt "  + Add connection…"))
+  Just i ->
+    let marker = if i == stConnIx st then "● " else "  "
+        label = maybe "?" connLabel (safeIx (stConns st) i)
+     in padRight Max (txt (marker <> label))
+
+safeIx :: [a] -> Int -> Maybe a
+safeIx xs i
+  | i >= 0 && i < length xs = Just (xs !! i)
+  | otherwise = Nothing
+
+-- | A full command reference, opened with @?@ from either listing.
+helpOverlay :: Widget Name
+helpOverlay =
+  overlay "All commands" $
+    vBox
+      [ withAttr folderAttr (txt "Navigation")
+      , txt "  ↑/↓        move selection"
+      , txt "  enter      open bucket / folder / file"
+      , txt "  esc / h    go back (quit from the bucket list)"
+      , txt "  r          refresh the current listing"
+      , txt "  q          quit"
+      , txt " "
+      , withAttr folderAttr (txt "Objects")
+      , txt "  u          upload a file from your computer"
+      , txt "  d          download the selected file"
+      , txt "  n          create a new folder"
+      , txt "  R          rename the selected file"
+      , txt "  x          delete the selected file"
+      , txt " "
+      , withAttr folderAttr (txt "Connections")
+      , txt "  c          open the connection switcher"
+      , txt "  a          add a connection (in the switcher)"
+      , txt "  enter      switch to the highlighted connection"
+      , txt " "
+      , withAttr helpAttr (txt "press any key to close")
+      ]
+
 overlay :: Text -> Widget Name -> Widget Name
 overlay title body =
   C.centerLayer . B.borderWithLabel (txt (" " <> title <> " ")) . hLimit 70 . padAll 1 $ body
@@ -212,7 +279,9 @@ appEvent be = do
         ScreenBuckets -> bucketsEvent ev
         ScreenObjects -> objectsEvent ev
         ScreenConfirmDelete -> confirmEvent ev
+        ScreenConnections -> connectionsEvent ev
         ScreenMessage back -> modify (\s -> s { stScreen = back })
+        ScreenHelp back -> modify (\s -> s { stScreen = back })
       _ -> pure ()
 
 bucketsEvent :: Vty.Event -> EventM Name AppState ()
@@ -220,6 +289,8 @@ bucketsEvent = \case
   Vty.EvKey (Vty.KChar 'q') [] -> halt
   Vty.EvKey Vty.KEsc [] -> halt
   Vty.EvKey (Vty.KChar 'r') [] -> refreshBuckets
+  Vty.EvKey (Vty.KChar 'c') [] -> openConnections
+  Vty.EvKey (Vty.KChar '?') [] -> openHelp
   Vty.EvKey Vty.KEnter [] -> openSelectedBucket
   ev -> zoom bucketsL (L.handleListEvent ev)
 
@@ -230,6 +301,8 @@ objectsEvent = \case
   Vty.EvKey (Vty.KChar 'h') [] -> goUp
   Vty.EvKey Vty.KEnter [] -> openSelectedRow
   Vty.EvKey (Vty.KChar 'r') [] -> refreshObjects
+  Vty.EvKey (Vty.KChar 'c') [] -> openConnections
+  Vty.EvKey (Vty.KChar '?') [] -> openHelp
   Vty.EvKey (Vty.KChar 'u') [] -> startPrompt ActUpload ""
   Vty.EvKey (Vty.KChar 'n') [] -> startPrompt ActNewFolder ""
   Vty.EvKey (Vty.KChar 'd') [] -> withSelectedFile "download" $ \row ->
@@ -247,7 +320,7 @@ confirmEvent = \case
     case (stBucket st, stPendingDelete st) of
       (Just b, Just row) -> do
         modify (\s -> s { stPendingDelete = Nothing })
-        runS3 (deleteKey (stEnv st) b (rowKey row)) $ \() -> do
+        runS3 (deleteKey (curEnv st) b (rowKey row)) $ \() -> do
           refreshObjects
           message ("deleted " <> rowKey row)
       _ -> cancelToObjects
@@ -258,6 +331,91 @@ confirmEvent = \case
 cancelToObjects :: EventM Name AppState ()
 cancelToObjects =
   modify (\s -> s { stScreen = ScreenObjects, stPendingDelete = Nothing })
+
+-- ---------------------------------------------------------------------------
+-- Connection switching (live, no restart)
+-- ---------------------------------------------------------------------------
+
+-- | Open the connection switcher, (re)building its list from the currently
+-- open connections plus a trailing "add a new connection" row.
+openConnections :: EventM Name AppState ()
+openConnections = modify (\s -> s { stScreen = ScreenConnections, stConnList = buildConnList s })
+
+-- | Open the full command reference, remembering the current screen so any
+-- key returns to it.
+openHelp :: EventM Name AppState ()
+openHelp = modify (\s -> s { stScreen = ScreenHelp (stScreen s) })
+
+-- | The switcher rows: one @Just i@ per open connection, then the 'Nothing'
+-- "add" row, with the selection parked on the active connection.
+buildConnList :: AppState -> L.List Name (Maybe Int)
+buildConnList s =
+  let items = map Just [0 .. length (stConns s) - 1] ++ [Nothing]
+   in L.listMoveTo (stConnIx s) (L.list ConnListW (V.fromList items) 1)
+
+-- | Leave the switcher, returning to whichever listing was underneath it.
+closeConnections :: EventM Name AppState ()
+closeConnections =
+  modify (\s -> s { stScreen = if stBucket s == Nothing then ScreenBuckets else ScreenObjects })
+
+connectionsEvent :: Vty.Event -> EventM Name AppState ()
+connectionsEvent = \case
+  Vty.EvKey Vty.KEsc [] -> closeConnections
+  Vty.EvKey (Vty.KChar 'c') [] -> closeConnections
+  Vty.EvKey (Vty.KChar 'q') [] -> closeConnections
+  Vty.EvKey (Vty.KChar 'a') [] -> addConnection
+  Vty.EvKey Vty.KEnter [] -> activateSelectedConn
+  ev -> zoom connListL (L.handleListEvent ev)
+
+activateSelectedConn :: EventM Name AppState ()
+activateSelectedConn = do
+  st <- get
+  case L.listSelectedElement (stConnList st) of
+    Just (_, Nothing) -> addConnection
+    Just (_, Just i) -> switchConn i
+    Nothing -> pure ()
+
+-- | Make connection @i@ active and reload its buckets. Switching to the
+-- already-active connection just closes the switcher.
+switchConn :: Int -> EventM Name AppState ()
+switchConn i = do
+  st <- get
+  if i == stConnIx st
+    then closeConnections
+    else do
+      modify $ \s ->
+        s
+          { stConnIx = i
+          , stBucket = Nothing
+          , stPrefix = ""
+          , stObjects = L.list ObjectListW V.empty 1
+          , stScreen = ScreenBuckets
+          }
+      refreshBuckets
+
+-- | Run the connection wizard on top of the running app (Brick's
+-- 'suspendAndResume'' hands the terminal to a fresh wizard instance), then
+-- append and activate whatever connection it returns. Cancelling leaves the
+-- switcher open and unchanged.
+addConnection :: EventM Name AppState ()
+addConnection = do
+  profiles <- liftIO listProfiles
+  disc <- liftIO (try newAwsEnv :: IO (Either SomeException Env))
+  mConn <- suspendAndResume' (connect (either (const Nothing) Just disc) profiles)
+  case mConn of
+    Nothing -> modify (\s -> s { stConnList = buildConnList s })
+    Just (label, env) -> do
+      modify $ \s ->
+        let conns = stConns s ++ [Conn label env]
+         in s
+              { stConns = conns
+              , stConnIx = length conns - 1
+              , stBucket = Nothing
+              , stPrefix = ""
+              , stObjects = L.list ObjectListW V.empty 1
+              , stScreen = ScreenBuckets
+              }
+      refreshBuckets
 
 promptEvent :: PendingAction -> BrickEvent Name e -> EventM Name AppState ()
 promptEvent act be = case be of
@@ -287,18 +445,18 @@ submitPrompt act = do
           ActUpload -> do
             path <- liftIO (expandUser (T.unpack input))
             let key = stPrefix st <> T.pack (takeFileName path)
-            runS3 (uploadFile (stEnv st) bucket key path) $ \() -> do
+            runS3 (uploadFile (curEnv st) bucket key path) $ \() -> do
               refreshObjects
               message ("uploaded " <> T.pack path <> " → " <> key)
           ActDownload -> case L.listSelectedElement (stObjects st) of
             Just (_, row) | not (rowIsFolder row) -> do
               dest <- liftIO (resolveDest (T.unpack input) (rowName row))
-              runS3 (downloadFile (stEnv st) bucket (rowKey row) dest) $ \() ->
+              runS3 (downloadFile (curEnv st) bucket (rowKey row) dest) $ \() ->
                 message ("downloaded " <> rowKey row <> " → " <> T.pack dest)
             _ -> message "select a file to download"
           ActNewFolder -> do
             let key = stPrefix st <> stripSlashes input <> "/"
-            runS3 (createFolderMarker (stEnv st) bucket key) $ \() -> do
+            runS3 (createFolderMarker (curEnv st) bucket key) $ \() -> do
               refreshObjects
               message ("created folder " <> key)
           ActRename -> case L.listSelectedElement (stObjects st) of
@@ -306,8 +464,8 @@ submitPrompt act = do
               let dst = stPrefix st <> stripSlashes input
               if dst == rowKey row
                 then message "cancelled: same key"
-                else runS3 (copyKey (stEnv st) bucket (rowKey row) dst) $ \() ->
-                  runS3 (deleteKey (stEnv st) bucket (rowKey row)) $ \() -> do
+                else runS3 (copyKey (curEnv st) bucket (rowKey row) dst) $ \() ->
+                  runS3 (deleteKey (curEnv st) bucket (rowKey row)) $ \() -> do
                     refreshObjects
                     message ("renamed " <> rowKey row <> " → " <> dst)
             _ -> message "select a file to rename"
@@ -352,7 +510,7 @@ goUp = do
 refreshBuckets :: EventM Name AppState ()
 refreshBuckets = do
   st <- get
-  runS3 (listAllBuckets (stEnv st)) $ \bs ->
+  runS3 (listAllBuckets (curEnv st)) $ \bs ->
     modify $ \s ->
       s
         { stBuckets = L.listReplace (V.fromList bs) (initialSel bs) (stBuckets s)
@@ -364,7 +522,7 @@ refreshObjects = do
   st <- get
   case stBucket st of
     Nothing -> pure ()
-    Just b -> runS3 (listObjectsUnder (stEnv st) b (stPrefix st)) $ \(dirs, files) -> do
+    Just b -> runS3 (listObjectsUnder (curEnv st) b (stPrefix st)) $ \(dirs, files) -> do
       let prefix = stPrefix st
           folderRows =
             [ ObjectRow p (segmentAfter prefix p) True Nothing

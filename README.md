@@ -70,6 +70,7 @@ use.
 | `R`         | object list        | prompt for a new name, rename selected file         |
 | `x`         | object list        | ask to confirm, then delete selected file           |
 | `r`         | list screens       | refresh current listing                             |
+| `c`         | list screens       | open the connection switcher                        |
 | `q`         | list screens       | quit                                                |
 | `Esc`       | bucket list        | quit                                                |
 | `Enter`     | prompt             | submit                                              |
@@ -79,9 +80,27 @@ use.
 Paths typed into the prompt may start with `~/`. A download destination that
 is an existing directory receives the object under its own name.
 
+## Connections
+
+yeez can hold **several connections open at once** and switch between them
+live, without restarting — useful for moving between AWS accounts, regions,
+or S3-compatible endpoints (MinIO, R2, Spaces).
+
+Press `c` on the bucket or object list to open the connection switcher:
+
+- `↑`/`↓` and `Enter` — make the highlighted connection active; yeez reloads
+  its bucket list immediately
+- `a` (or the `+ Add connection…` row) — run the setup wizard on top of the
+  running app to add another connection (detected credentials, a named
+  profile, or hand-entered keys/region/endpoint), then switch to it
+- `Esc` / `c` — close the switcher
+
+The active connection is marked with `●`. At startup the first connection is
+whatever the setup wizard (or the ambient credential chain) established.
+
 ## Screens
 
-The app is a single-window state machine with five screens:
+The app is a single-window state machine with six screens:
 
 - **Bucket list** (`ScreenBuckets`) — top level, lists all buckets
 - **Object list** (`ScreenObjects`) — objects/folders under the current
@@ -91,6 +110,8 @@ The app is a single-window state machine with five screens:
 - **Confirm delete** (`ScreenConfirmDelete`) — y/n gate before any delete
 - **Message** (`ScreenMessage`) — transient status message, returns to the
   screen it came from on any key
+- **Connections** (`ScreenConnections`) — the connection switcher: pick an
+  open connection or add a new one, live
 
 ## Module layout
 
