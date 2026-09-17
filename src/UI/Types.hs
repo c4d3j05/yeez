@@ -16,11 +16,16 @@ module UI.Types
     -- * Object rows
   , ObjectRow (..)
 
+    -- * Connections
+  , Conn (..)
+  , curEnv
+
     -- * Application state
   , AppState (..)
   , bucketsL
   , objectsL
   , editorL
+  , connListL
   ) where
 
 import Amazonka (Env)
@@ -34,6 +39,7 @@ data Name
   = BucketListW
   | ObjectListW
   | PathEditorW
+  | ConnListW
   deriving (Eq, Ord, Show)
 
 -- | What the single-line prompt is currently collecting input for.
@@ -56,6 +62,10 @@ data Screen
     -- ^ y\/n gate in front of a delete.
   | ScreenMessage Screen
     -- ^ Transient status message; the payload is the screen to return to.
+  | ScreenConnections
+    -- ^ The connection switcher: pick an open connection or add a new one.
+  | ScreenHelp Screen
+    -- ^ A full command reference; the payload is the screen to return to.
   deriving (Eq, Show)
 
 -- | Human-readable prompt text for each thing the prompt can collect.
@@ -82,10 +92,28 @@ data ObjectRow = ObjectRow
     -- ^ Size in bytes, for files only.
   } deriving (Eq, Show)
 
+-- | One open connection: a validated AWS 'Env' plus a human-readable label
+-- (a profile name, a saved-as name, an endpoint host, or @\"detected\"@).
+data Conn = Conn
+  { connLabel :: Text
+    -- ^ Display name shown in the connection switcher.
+  , connEnv :: Env
+    -- ^ The validated AWS environment for this connection.
+  }
+
+-- | The AWS environment of the currently active connection.
+curEnv :: AppState -> Env
+curEnv st = connEnv (stConns st !! stConnIx st)
+
 -- | The entire application state.
 data AppState = AppState
-  { stEnv :: Env
-    -- ^ AWS environment, built once at startup by @Amazonka.discover@.
+  { stConns :: [Conn]
+    -- ^ All open connections; yeez can switch between them live.
+  , stConnIx :: Int
+    -- ^ Index into 'stConns' of the active connection.
+  , stConnList :: L.List Name (Maybe Int)
+    -- ^ Switcher rows: @Just i@ selects connection @i@, 'Nothing' is the
+    -- \"add a new connection\" row. Rebuilt each time the switcher opens.
   , stBuckets :: L.List Name Text
     -- ^ Bucket names.
   , stObjects :: L.List Name ObjectRow
@@ -112,3 +140,6 @@ objectsL f s = (\x -> s { stObjects = x }) <$> f (stObjects s)
 
 editorL :: Lens' AppState (E.Editor Text Name)
 editorL f s = (\x -> s { stEditor = x }) <$> f (stEditor s)
+
+connListL :: Lens' AppState (L.List Name (Maybe Int))
+connListL f s = (\x -> s { stConnList = x }) <$> f (stConnList s)
