@@ -92,8 +92,9 @@ data CState = CState
   , csStatus :: Text
   , csDiscover :: Maybe Env
     -- ^ Pre-discovered env, offered as 'IDiscover'.
-  , csResult :: Maybe Env
-    -- ^ Set once a connection validates; the app halts immediately after.
+  , csResult :: Maybe (Text, Env)
+    -- ^ Set once a connection validates (label plus env); the app halts
+    -- immediately after.
   }
 
 csListL :: Lens' CState (L.List CName CItem)
@@ -108,9 +109,10 @@ csEditorL f s = (\x -> s { csEditor = x }) <$> f (csEditor s)
 
 -- | Run the wizard. @mDisc@ is the environment discovered from the ambient
 -- credential chain (offered as the first choice when present); @profiles@
--- are the named profiles found in @~\/.aws\/credentials@. Returns the
--- connected 'Env', or 'Nothing' if the user quit without connecting.
-connect :: Maybe Env -> [Text] -> IO (Maybe Env)
+-- are the named profiles found in @~\/.aws\/credentials@. Returns a labelled
+-- connection (a display name plus the validated 'Env'), or 'Nothing' if the
+-- user quit without connecting.
+connect :: Maybe Env -> [Text] -> IO (Maybe (Text, Env))
 connect mDisc profiles = do
   let items =
         maybe [] (const [IDiscover]) mDisc
@@ -230,16 +232,16 @@ activateSelected = do
     Nothing -> pure ()
     Just (_, it) -> case it of
       IDiscover -> case csDiscover st of
-        Just env -> attempt (pure env) (pure ())
+        Just env -> attempt "detected" (pure env) (pure ())
         Nothing -> setMsg "no detected credentials"
       IProfile name -> do
         mp <- liftIO (loadProfile name)
         case mp of
-          Just params -> attempt (newAwsEnvFromParams params) (pure ())
+          Just params -> attempt name (newAwsEnvFromParams params) (pure ())
           -- Profile has no static keys (e.g. SSO): fall back to the
           -- discovery chain with AWS_PROFILE pointed at it.
           Nothing ->
-            attempt (setEnv "AWS_PROFILE" (T.unpack name) >> newAwsEnv) (pure ())
+            attempt name (setEnv "AWS_PROFILE" (T.unpack name) >> newAwsEnv) (pure ())
       INew -> startNew
 
 startNew :: EventM CName CState ()
@@ -266,21 +268,36 @@ storeAndAdvance step = do
       modify (\s -> s { csDraft = d' })
       let params = draftToParams d'
       attempt
+        (newLabel d')
         (newAwsEnvFromParams params)
         (unless (T.null (dSaveAs d')) (saveProfile (dSaveAs d') params))
 
+-- | A display label for a hand-entered connection: the saved-as name if the
+-- user chose to save it, otherwise the endpoint host or, failing that, the
+-- region.
+newLabel :: Draft -> Text
+newLabel d
+  | not (T.null (dSaveAs d)) = dSaveAs d
+  | not (T.null (dEndpoint d)) = endpointHost (dEndpoint d)
+  | otherwise = "custom (" <> dRegion d <> ")"
+  where
+    endpointHost = T.takeWhile (/= '/') . stripScheme
+    stripScheme u = case T.breakOn "://" u of
+      (_, r) | not (T.null r) -> T.drop 3 r
+      _ -> u
+
 -- | Build an env, validate it with a @ListBuckets@ call, and on success run
--- @onOk@ (e.g. persist the profile), record the env and halt. Any failure
--- becomes a message screen.
-attempt :: IO Env -> IO () -> EventM CName CState ()
-attempt mkEnv onOk = do
+-- @onOk@ (e.g. persist the profile), record the labelled env and halt. Any
+-- failure becomes a message screen.
+attempt :: Text -> IO Env -> IO () -> EventM CName CState ()
+attempt label mkEnv onOk = do
   r <- liftIO (try (mkEnv >>= \e -> listAllBuckets e >> pure e))
   case r of
     Left (e :: SomeException) ->
       setMsg ("connection failed: " <> oneLine e)
     Right env -> do
       liftIO onOk
-      modify (\s -> s { csResult = Just env })
+      modify (\s -> s { csResult = Just (label, env) })
       halt
 
 setMsg :: Text -> EventM CName CState ()
