@@ -150,7 +150,7 @@ uploadFile :: Env -> Text -> Text -> FilePath -> IO ()
 uploadFile env bucket key path = do
   body <- AWS.hashedFile path
   runResourceT . void $
-    AWS.send env (S3.newPutObject (S3.BucketName bucket) (S3.ObjectKey key) body)
+    AWS.send env (S3.newPutObject (S3.BucketName bucket) (S3.ObjectKey key) (AWS.toBody body))
 
 -- | Download @bucket\/key@ to a local path (@GetObject@).
 downloadFile :: Env -> Text -> Text -> FilePath -> IO ()
