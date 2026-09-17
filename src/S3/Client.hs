@@ -140,9 +140,15 @@ listObjectsUnder env bucket prefix = runResourceT $ do
         & S3L.listObjectsV2_prefix .~ (if T.null prefix then Nothing else Just prefix)
 
 -- | Upload a local file to @bucket\/key@ (@PutObject@).
+--
+-- Uses 'AWS.hashedFile' (a single SHA256-signed payload) rather than
+-- 'AWS.chunkedFile'. Chunked uploads set @x-amz-content-sha256:
+-- STREAMING-AWS4-HMAC-SHA256-PAYLOAD@ with @Content-Encoding: aws-chunked@,
+-- which corporate reverse proxies often reject or rewrite; a hashed body is
+-- an ordinary signed request that passes through cleanly.
 uploadFile :: Env -> Text -> Text -> FilePath -> IO ()
 uploadFile env bucket key path = do
-  body <- AWS.chunkedFile AWS.defaultChunkSize path
+  body <- AWS.hashedFile path
   runResourceT . void $
     AWS.send env (S3.newPutObject (S3.BucketName bucket) (S3.ObjectKey key) body)
 
