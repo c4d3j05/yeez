@@ -1,0 +1,112 @@
+name: release
+
+# Cut a release straight from the Actions tab:
+#   Actions ▸ release ▸ Run workflow ▸ version: 0.1.0
+#
+# One dispatch does the whole thing, self-contained (no cross-workflow tag
+# trigger, which the default GITHUB_TOKEN would suppress anyway):
+#
+#   1. bump the version in yeez.cabal and Formula/yeez.rb
+#   2. build the Apple Silicon binary
+#   3. commit the bump to main and (force-)tag vX.Y.Z
+#   4. update the Homebrew formula's sha256 to the freshly built binary
+#   5. publish/refresh the GitHub Release with the binary attached
+#
+# Re-running with a version that already exists re-releases it (the tag is
+# moved and the release updated), so this is also how you "push 0.1.0 again".
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, no leading v (e.g. 0.1.0)"
+        required: true
+
+permissions:
+  contents: write # commit the bump, move the tag, publish the release
+
+# Never let two releases run at once.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release yeez ${{ github.event.inputs.version }}
+    runs-on: macos-14 # Apple Silicon — the only architecture we ship
+    steps:
+      - name: Validate version
+        id: v
+        run: |
+          VER="${{ github.event.inputs.version }}"
+          echo "$VER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            || { echo "::error::version must be X.Y.Z with no leading v (got '$VER')"; exit 1; }
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up GHC and Cabal
+        id: setup
+        uses: haskell-actions/setup@v2
+        with:
+          ghc-version: '9.4.8'
+          cabal-version: '3.10.3.0'
+
+      - name: Cache Cabal store
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ steps.setup.outputs.cabal-store }}
+            dist-newstyle
+          key: release-arm64-ghc9.4.8-${{ hashFiles('**/*.cabal') }}
+          restore-keys: release-arm64-ghc9.4.8-
+
+      - name: Bump version in yeez.cabal
+        run: |
+          VER="${{ steps.v.outputs.version }}"
+          sed -i '' -E "s/^version:([[:space:]]+).*/version:\1$VER/" yeez.cabal
+          grep '^version:' yeez.cabal
+
+      - name: Build binary
+        run: |
+          cabal update
+          cabal build exe:yeez
+          mkdir -p dist
+          cp "$(cabal list-bin exe:yeez)" dist/yeez-macos-arm64
+          strip dist/yeez-macos-arm64 || true
+          file dist/yeez-macos-arm64
+
+      - name: Compute checksum
+        id: sum
+        run: echo "sha256=$(shasum -a 256 dist/yeez-macos-arm64 | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Update Homebrew formula
+        run: |
+          VER="${{ steps.v.outputs.version }}"
+          SHA="${{ steps.sum.outputs.sha256 }}"
+          sed -i '' -E "s/version \"[0-9.]+\"/version \"$VER\"/" Formula/yeez.rb
+          sed -i '' -E "s#download/v[0-9.]+/#download/v$VER/#g" Formula/yeez.rb
+          sed -i '' -E "s/sha256 \"[a-f0-9]{64}\"/sha256 \"$SHA\"/" Formula/yeez.rb
+
+      - name: Commit bump + formula, move tag
+        run: |
+          VER="${{ steps.v.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add yeez.cabal Formula/yeez.rb
+          git commit -m "Release v$VER" || echo "no version change to commit"
+          git tag -f -a "v$VER" -m "yeez $VER"
+          git push origin main
+          git push -f origin "v$VER"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.v.outputs.version }}
+          name: yeez ${{ steps.v.outputs.version }}
+          files: dist/yeez-macos-arm64
+          fail_on_unmatched_files: true
