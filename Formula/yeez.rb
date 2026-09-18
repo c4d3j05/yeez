@@ -23,7 +23,7 @@ class Yeez < Formula
     end
     on_intel do
       # No prebuilt Intel binary is published. Build from source instead:
-      #   brew install --HEAD c4d3j05/tap/yeez
+      #   brew install --HEAD https://raw.githubusercontent.com/c4d3j05/yeez/main/Formula/yeez.rb
       odie "yeez ships a prebuilt binary for Apple Silicon only; " \
            "install from source with `brew install --HEAD`."
     end
