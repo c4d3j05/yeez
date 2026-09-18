@@ -9,8 +9,8 @@
 --
 -- Region and endpoint live in the same section as the keys so that a
 -- yeez-written profile round-trips through 'loadProfile'. @region@ is a key
--- the AWS CLI reads too; @endpoint_url@ is understood by the AWS CLI v2 and
--- simply ignored by tools that do not know it.
+-- the AWS CLI reads too; @endpoint_url@ and @ca_bundle@ are understood by
+-- the AWS CLI v2 and simply ignored by tools that do not know them.
 --
 -- Note: 'saveProfile' rewrites the file from its parsed @key = value@ pairs,
 -- so hand-written comments and blank-line formatting in the file are not
@@ -55,12 +55,14 @@ loadProfile name = do
     secret <- lookup "aws_secret_access_key" kvs
     let region = maybe "us-east-1" id (lookup "region" kvs)
         endpoint = lookup "endpoint_url" kvs
+        caBundle = T.unpack <$> lookup "ca_bundle" kvs
     pure
       ConnParams
         { cpAccessKey = access
         , cpSecretKey = secret
         , cpRegion = region
         , cpEndpoint = endpoint
+        , cpCaBundle = caBundle
         }
 
 -- | Write (or replace) a named profile in @~\/.aws\/credentials@, creating
@@ -83,6 +85,7 @@ sectionKVs cp =
   , ("region", cpRegion cp)
   ]
     ++ maybe [] (\e -> [("endpoint_url", e)]) (cpEndpoint cp)
+    ++ maybe [] (\c -> [("ca_bundle", T.pack c)]) (cpCaBundle cp)
 
 -- ---------------------------------------------------------------------------
 -- Minimal INI

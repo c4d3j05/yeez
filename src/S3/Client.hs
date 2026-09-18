@@ -14,7 +14,11 @@
 module S3.Client
   ( ConnParams (..)
   , newAwsEnv
+  , newAwsEnvWith
   , newAwsEnvFromParams
+  , CaBundleError (..)
+  , caBundleManager
+  , isCertificateError
   , listAllBuckets
   , ConnCheck (..)
   , checkConnection
@@ -31,7 +35,7 @@ import Amazonka (Env)
 import qualified Amazonka.Auth as Auth
 import qualified Amazonka.S3 as S3
 import qualified Amazonka.S3.Lens as S3L
-import Control.Exception (SomeException, displayException, try)
+import Control.Exception (Exception (..), SomeException, displayException, throwIO, try)
 import Control.Monad (void)
 import Control.Monad.Trans.Resource (runResourceT)
 import qualified Data.ByteString as BS
@@ -43,7 +47,12 @@ import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Text.Encoding (encodeUtf8)
+import qualified Data.X509.CertificateStore as X509
 import Lens.Micro ((&), (.~), (^.))
+import qualified Network.Connection as NC
+import qualified Network.HTTP.Client as HTTP
+import Network.HTTP.Client.TLS (mkManagerSettings, tlsManagerSettings)
+import qualified Network.TLS as TLS
 import Numeric (showHex)
 import Text.Read (readMaybe)
 
@@ -61,20 +70,97 @@ data ConnParams = ConnParams
     -- ^ Region, e.g. @\"us-east-1\"@.
   , cpEndpoint :: Maybe Text
     -- ^ Optional endpoint URL, e.g. @\"https:\/\/minio.example.com:9000\"@.
+  , cpCaBundle :: Maybe FilePath
+    -- ^ Optional PEM file of CA certificates to trust for this connection.
+    -- When set, it replaces the platform trust store entirely (see
+    -- 'caBundleManager'); when absent, the default system store is used.
   } deriving (Eq, Show)
+
+-- | A CA bundle that yielded no usable trust anchors.
+--
+-- Missing path, unreadable file, valid PEM holding no certificates: all
+-- three collapse into one error because 'X509.readCertificateStore' cannot
+-- tell them apart — it returns 'Just' only for a store with at least one
+-- certificate, and 'Nothing' for every other outcome.
+--
+-- This is raised rather than letting an empty store through, because an
+-- empty store fails every handshake with the same \"unknown CA\" message the
+-- bundle was supposed to fix — sending the user round the same loop with no
+-- new information.
+newtype CaBundleError = CaBundleUnusable FilePath
+  deriving (Eq, Show)
+
+instance Exception CaBundleError where
+  displayException = T.unpack . caBundleErrorText
+
+-- | One-line description of a 'CaBundleError'.
+caBundleErrorText :: CaBundleError -> Text
+caBundleErrorText (CaBundleUnusable p) =
+  "no CA certificates could be read from "
+    <> T.pack p
+    <> " — expected a PEM file, or a directory of PEM files"
+
+-- | An HTTP manager that trusts exactly the CAs in @path@ (a PEM bundle).
+--
+-- This deliberately bypasses the platform trust store that @x509-system@
+-- reads. On macOS that reader shells out to
+-- @security find-certificate -pa@ over exactly two keychains —
+-- @SystemRootCertificates.keychain@ and @\/Library\/Keychains\/System.keychain@
+-- — and never the user's login keychain. A CA added by double-clicking a
+-- @.cer@ (which lands in the login keychain by default) is therefore
+-- invisible to it, even though every other tool on the machine trusts it.
+-- That is the usual cause of \"unknown CA\" against an internal
+-- S3-compatible endpoint or a TLS-inspecting proxy. Reading a PEM file
+-- directly is predictable and behaves the same on every platform.
+--
+-- Only 'TLS.sharedCAStore' is overridden: the rest of the client parameters
+-- stay at 'TLS.defaultParamsClient' (which already supplies
+-- @ciphersuite_default@ and TLS 1.2/1.3), and the hostname used for
+-- certificate and SNI validation is filled in per connection by
+-- @crypton-connection@, so every connection is still fully validated
+-- against the name it actually dialled.
+caBundleManager :: FilePath -> IO HTTP.Manager
+caBundleManager path = do
+  mstore <- X509.readCertificateStore path
+  store <- maybe (throwIO (CaBundleUnusable path)) pure mstore
+  let base = TLS.defaultParamsClient "" ""
+      params =
+        base
+          { TLS.clientShared =
+              (TLS.clientShared base) { TLS.sharedCAStore = store }
+          }
+  HTTP.newManager (mkManagerSettings (NC.TLSSettings params) Nothing)
+
+-- | The manager a connection should use: a CA-bundle-backed one when a
+-- bundle is configured, otherwise the stock system-trust manager.
+managerFor :: Maybe FilePath -> IO HTTP.Manager
+managerFor Nothing = HTTP.newManager tlsManagerSettings
+managerFor (Just path) = caBundleManager path
 
 -- | Build an AWS environment using the standard credential chain:
 -- environment variables, @~\/.aws\/credentials@, container/instance role.
 newAwsEnv :: IO Env
-newAwsEnv = AWS.newEnv AWS.discover
+newAwsEnv = newAwsEnvWith Nothing
+
+-- | 'newAwsEnv', but trusting the CAs in the given PEM bundle.
+--
+-- The manager is built before credential discovery runs, so a discovery step
+-- that itself speaks HTTPS (a container or instance role endpoint) goes
+-- through the same trust store as the S3 calls that follow.
+newAwsEnvWith :: Maybe FilePath -> IO Env
+newAwsEnvWith mca = do
+  mgr <- managerFor mca
+  AWS.newEnvFromManager mgr AWS.discover
 
 -- | Build an AWS environment from explicit 'ConnParams': static keys, an
--- overridden region and, optionally, a custom S3 endpoint with path-style
--- addressing.
+-- overridden region, optionally a custom S3 endpoint with path-style
+-- addressing, and optionally a PEM CA bundle to trust.
 newAwsEnvFromParams :: ConnParams -> IO Env
 newAwsEnvFromParams cp = do
+  mgr <- managerFor (cpCaBundle cp)
   base <-
-    AWS.newEnv
+    AWS.newEnvFromManager
+      mgr
       ( pure
           . Auth.fromKeys
               (AWS.AccessKey (encodeUtf8 (cpAccessKey cp)))
@@ -122,10 +208,39 @@ data ConnCheck
     -- @AccessDenied@). This is the normal shape of a bucket-scoped IAM
     -- policy: the connection works, it just cannot enumerate buckets, so the
     -- user must open a bucket by name.
+  | ConnCertError Text
+    -- ^ The TLS handshake was rejected on trust grounds: an unknown or
+    -- self-signed CA, a name mismatch, an expired certificate. Kept apart
+    -- from 'ConnFailed' because it is recoverable without changing any
+    -- credential — pointing yeez at the right CA bundle is enough.
   | ConnFailed Text
     -- ^ Anything else — bad keys, wrong endpoint, network error, …. The text
     -- is a one-line, human-readable summary.
   deriving (Eq, Show)
+
+-- | Whether a rendered exception looks like a TLS trust failure rather than
+-- an ordinary transport or credential error.
+--
+-- This matches on rendered text because the failure arrives wrapped: the
+-- @tls@ exception is buried inside @http-client@'s @InternalException@,
+-- which amazonka in turn re-wraps, and the constructors involved differ
+-- between @tls@ releases. Matching the rendered form is stable across all
+-- of them. It errs towards matching: a false positive only offers the user
+-- a CA-bundle prompt they can decline, whereas a false negative sends them
+-- back to an unhelpful hard failure.
+isCertificateError :: Text -> Bool
+isCertificateError msg = any (`T.isInfixOf` T.toLower msg) needles
+  where
+    needles =
+      [ "certificate"       -- "certificate rejected", CertificateUnknown, …
+      , "unknownca"         -- tls's UnknownCa alert
+      , "unknown ca"
+      , "handshakefailed"
+      , "tlsexception"
+      , "tlsnotsupported"
+      , "self-signed"
+      , "selfsigned"
+      ]
 
 -- | Probe @env@ with a @ListBuckets@ call and classify the result.
 --
@@ -134,15 +249,21 @@ data ConnCheck
 -- authenticated the request and only authorization was refused, so the
 -- credentials themselves are good. We match on the S3 error code
 -- (@AccessDenied@) and HTTP status (@403@) in the rendered error rather than
--- amazonka's shifting record/lens names.
+-- amazonka's shifting record/lens names. A TLS trust failure is likewise
+-- singled out as 'ConnCertError' so the caller can offer a CA bundle
+-- instead of treating it as a dead end.
 checkConnection :: Env -> IO ConnCheck
 checkConnection env = do
   r <- try (listAllBuckets env)
   pure $ case r of
     Right _ -> ConnOK
     Left (e :: SomeException) ->
-      let msg = T.pack (displayException e)
-       in if isDenied msg then ConnDenied else ConnFailed (oneLine msg)
+      let msg = oneLine (T.pack (displayException e))
+       in if isDenied msg
+            then ConnDenied
+            else if isCertificateError msg
+              then ConnCertError msg
+              else ConnFailed msg
   where
     isDenied m =
       "AccessDenied" `T.isInfixOf` m

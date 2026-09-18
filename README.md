@@ -121,6 +121,70 @@ press `g` to try another.
 To grant full listing instead, attach a policy allowing `s3:ListAllMyBuckets`
 on `*`.
 
+## Custom CA bundles (private or corporate certificates)
+
+Internal S3-compatible endpoints often present a certificate signed by a
+private CA — a corporate root, or a TLS-inspecting proxy. The symptom is a
+connection that dies on trust grounds:
+
+```
+connection failed: ... HandshakeFailed ... certificate has unknown CA
+```
+
+yeez treats that as recoverable rather than fatal. Whenever a connection
+fails on certificate grounds — at first launch, when picking a profile, or
+when adding a connection from the switcher with `c` → `a` — the wizard asks
+for a trust store instead of giving up:
+
+```
+ Certificate problem
+ ... certificate rejected: unknown CA
+
+ Path to a CA bundle in PEM format to trust for this connection:
+ ~/certs/corp-root.pem
+ enter retry · esc cancel
+```
+
+Give it a PEM file (or a directory of them) holding the CA — or the whole
+chain — and yeez retries the *same* connection against a trust store built
+from that file alone. `esc` backs out and shows the original error.
+
+**The bundle replaces the system trust store for that connection; it does not
+add to it.** Certificate and hostname validation still run in full: only the
+set of trusted roots changes. A certificate from an unrelated CA, or one
+whose name does not match the host being dialled, is still rejected. There is
+no "skip verification" option, by design.
+
+When you save the connection as a profile, the path is recorded as
+`ca_bundle` so it reconnects without prompting:
+
+```ini
+[minio-internal]
+aws_access_key_id = ...
+aws_secret_access_key = ...
+region = us-east-1
+endpoint_url = https://minio.corp.example.com:9000
+ca_bundle = /Users/me/certs/corp-root.pem
+```
+
+`ca_bundle` is the same key the AWS CLI v2 uses, so a profile that already
+sets it is picked up by yeez with no extra work.
+
+### Why a file instead of the system store
+
+On macOS the default reader (`x509-system`) shells out to
+`security find-certificate -pa` over exactly two keychains —
+`SystemRootCertificates.keychain` and `/Library/Keychains/System.keychain`.
+It never reads your **login** keychain, which is where a CA lands if you
+install it by double-clicking a `.cer`. So a root that every other tool on
+the machine trusts can still be invisible to yeez. Pointing at a PEM file
+sidesteps the platform reader entirely and behaves identically on macOS,
+Linux and in the Docker image.
+
+Existing profiles are never rewritten behind your back: supplying a bundle
+for a profile that lacks one fixes the current session, but yeez will ask
+again next launch unless you add `ca_bundle` to that profile yourself.
+
 ## Screens
 
 The app is a single-window state machine with six screens:
@@ -146,11 +210,14 @@ src/UI/Types.hs    -- shared state/types for the TUI
 src/UI/App.hs      -- Brick drawing + event handling, the state machine
 ```
 
-`S3.Client` exposes `newAwsEnv`, `listAllBuckets`, `listObjectsUnder`,
-`uploadFile`, `downloadFile`, `deleteKey`, `copyKey` and
-`createFolderMarker`. Nothing outside this module calls amazonka directly —
-the UI layer only knows about these eight functions, and they speak in
-`Text` and `FilePath` rather than in amazonka types.
+`S3.Client` exposes the environment constructors (`newAwsEnv`,
+`newAwsEnvWith`, `newAwsEnvFromParams`), the connection probe
+(`checkConnection`) and the CRUD calls themselves (`listAllBuckets`,
+`listObjectsUnder`, `uploadFile`, `downloadFile`, `deleteKey`, `copyKey`,
+`createFolderMarker`), plus the TLS helpers `caBundleManager` and
+`isCertificateError`. Nothing outside this module calls amazonka — or the
+TLS stack — directly, and everything it exposes speaks in `Text` and
+`FilePath` rather than in amazonka types.
 
 ## Non-goals
 
