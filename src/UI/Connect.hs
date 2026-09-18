@@ -20,6 +20,11 @@
 -- Every choice is validated with a real @ListBuckets@ call before the
 -- wizard returns, so a bad credential fails here rather than on the first
 -- action inside the app.
+--
+-- A TLS trust failure is treated as recoverable rather than fatal: instead
+-- of dropping the user at an error they cannot act on, the wizard asks for
+-- the path to a PEM CA bundle and retries the same connection with it. See
+-- 'Attempt', which is what makes that retry possible.
 module UI.Connect (connect) where
 
 import Amazonka (Env)
@@ -43,10 +48,12 @@ import S3.Client
   ( ConnCheck (..)
   , ConnParams (..)
   , checkConnection
-  , newAwsEnv
+  , isCertificateError
   , newAwsEnvFromParams
+  , newAwsEnvWith
   )
 import System.Environment (setEnv)
+import UI.Types (expandUser)
 
 -- ---------------------------------------------------------------------------
 -- Types
@@ -89,6 +96,24 @@ data CScreen
     -- ^ Collecting one field of the new-connection form.
   | CMessage
     -- ^ A status/error message; any key returns to the picker.
+  | CCaBundle
+    -- ^ Asking for a CA bundle path after a certificate failure.
+
+-- | A connection attempt, in a form that can be run more than once.
+--
+-- Recovering from a certificate error means building the /same/ connection
+-- again with a different trust store, so an attempt cannot be a plain
+-- @IO Env@ that has already baked in its TLS settings. Parameterising both
+-- the env and the save step over the bundle path keeps the retry honest:
+-- the connection that gets validated is the one that gets saved.
+data Attempt = Attempt
+  { atLabel :: Text
+    -- ^ Display name for the resulting connection.
+  , atEnv :: Maybe FilePath -> IO Env
+    -- ^ Build the environment, optionally trusting a CA bundle.
+  , atSave :: Maybe FilePath -> IO ()
+    -- ^ Run on success (persisting a profile, or nothing at all).
+  }
 
 data CState = CState
   { csList :: L.List CName CItem
@@ -98,6 +123,12 @@ data CState = CState
   , csStatus :: Text
   , csDiscover :: Maybe Env
     -- ^ Pre-discovered env, offered as 'IDiscover'.
+  , csPending :: Maybe Attempt
+    -- ^ The attempt that hit a certificate error, kept so 'CCaBundle' can
+    -- retry it once the user supplies a bundle.
+  , csCaPath :: Text
+    -- ^ Last CA bundle path entered, pre-filled on the next prompt. One
+    -- bundle usually fixes every endpoint behind the same proxy.
   , csResult :: Maybe (Text, Env)
     -- ^ Set once a connection validates (label plus env); the app halts
     -- immediately after.
@@ -132,6 +163,8 @@ connect mDisc profiles = do
           , csEditor = editorFor SAccess emptyDraft
           , csStatus = ""
           , csDiscover = mDisc
+          , csPending = Nothing
+          , csCaPath = ""
           , csResult = Nothing
           }
   csResult <$> defaultMain wizardApp st0
@@ -149,6 +182,7 @@ wizardApp =
 cChooseCursor :: CState -> [CursorLocation CName] -> Maybe (CursorLocation CName)
 cChooseCursor st = case csScreen st of
   CField _ -> showCursorNamed CEdit
+  CCaBundle -> showCursorNamed CEdit
   _ -> neverShowCursor st
 
 -- ---------------------------------------------------------------------------
@@ -160,6 +194,7 @@ cDraw st = case csScreen st of
   CPick -> [pickScreen st]
   CField step -> [fieldOverlay st step, pickScreen st]
   CMessage -> [msgOverlay st, pickScreen st]
+  CCaBundle -> [caOverlay st, pickScreen st]
 
 pickScreen :: CState -> Widget CName
 pickScreen st =
@@ -189,6 +224,34 @@ fieldOverlay st step =
   where
     renderContents SSecret ts = txt (T.replicate (T.length (T.concat ts)) "•")
     renderContents _ ts = txt (T.concat ts)
+
+-- | The certificate-error recovery prompt: what went wrong, plus a path
+-- box for the CA bundle to trust instead of the system store.
+caOverlay :: CState -> Widget CName
+caOverlay st =
+  overlay "Certificate problem" $
+    vBox
+      [ txtWrap (briefly (csStatus st))
+      , txt " "
+      , txt "Path to a CA bundle in PEM format to trust for this connection:"
+      , hLimit 60 (vLimit 1 (E.renderEditor (txt . T.concat) True (csEditor st)))
+      , withAttr helpAttr (txt "enter retry · esc cancel")
+      ]
+
+-- | Trim a rendered exception down for the certificate prompt, keeping the
+-- /end/ of it.
+--
+-- amazonka renders the entire 'Request' record into its errors, so the head
+-- of the message is nothing but headers and hostnames while the part that
+-- says @certificate has unknown CA@ sits at the very end. Keeping the head
+-- would show the user only noise and push the input box off a short
+-- terminal; the full text is still shown on the message screen.
+briefly :: Text -> Text
+briefly t
+  | T.length t <= limit = t
+  | otherwise = "… " <> T.takeEnd limit t
+  where
+    limit = 240
 
 msgOverlay :: CState -> Widget CName
 msgOverlay st =
@@ -220,6 +283,10 @@ cEvent be = do
     CMessage -> case be of
       VtyEvent _ -> toPick
       _ -> pure ()
+    CCaBundle -> case be of
+      VtyEvent (Vty.EvKey Vty.KEsc []) -> showPendingError
+      VtyEvent (Vty.EvKey Vty.KEnter []) -> submitCaBundle
+      _ -> zoom csEditorL (E.handleEditorEvent be)
 
 toPick :: EventM CName CState ()
 toPick = modify (\s -> s { csScreen = CPick })
@@ -238,16 +305,34 @@ activateSelected = do
     Nothing -> pure ()
     Just (_, it) -> case it of
       IDiscover -> case csDiscover st of
-        Just env -> attempt "detected" (pure env) (pure ())
         Nothing -> setMsg "no detected credentials"
+        Just env ->
+          runAttempt
+            Attempt
+              { atLabel = "detected"
+              , atEnv = \case
+                  -- Without a bundle, reuse the env the caller discovered;
+                  -- with one, rediscover so the probe uses the new store.
+                  Nothing -> pure env
+                  Just ca -> newAwsEnvWith (Just ca)
+              , atSave = const (pure ())
+              }
+            Nothing
       IProfile name -> do
         mp <- liftIO (loadProfile name)
-        case mp of
-          Just params -> attempt name (newAwsEnvFromParams params) (pure ())
-          -- Profile has no static keys (e.g. SSO): fall back to the
-          -- discovery chain with AWS_PROFILE pointed at it.
-          Nothing ->
-            attempt name (setEnv "AWS_PROFILE" (T.unpack name) >> newAwsEnv) (pure ())
+        runAttempt
+          Attempt
+            { atLabel = name
+            , atEnv = case mp of
+                Just params -> \ca -> newAwsEnvFromParams params { cpCaBundle = ca }
+                -- Profile has no static keys (e.g. SSO): fall back to the
+                -- discovery chain with AWS_PROFILE pointed at it.
+                Nothing -> \ca ->
+                  setEnv "AWS_PROFILE" (T.unpack name) >> newAwsEnvWith ca
+            , atSave = const (pure ())
+            }
+          -- A profile that already records a ca_bundle uses it first time.
+          (mp >>= cpCaBundle)
       INew -> startNew
 
 startNew :: EventM CName CState ()
@@ -273,10 +358,17 @@ storeAndAdvance step = do
     Nothing -> do
       modify (\s -> s { csDraft = d' })
       let params = draftToParams d'
-      attempt
-        (newLabel d')
-        (newAwsEnvFromParams params)
-        (unless (T.null (dSaveAs d')) (saveProfile (dSaveAs d') params))
+      runAttempt
+        Attempt
+          { atLabel = newLabel d'
+          , atEnv = \ca -> newAwsEnvFromParams params { cpCaBundle = ca }
+            -- Save whatever bundle actually made the connection work, so
+            -- the profile reconnects cleanly without prompting again.
+          , atSave = \ca ->
+              unless (T.null (dSaveAs d')) $
+                saveProfile (dSaveAs d') params { cpCaBundle = ca }
+          }
+        Nothing
 
 -- | A display label for a hand-entered connection: the saved-as name if the
 -- user chose to save it, otherwise the endpoint host or, failing that, the
@@ -292,27 +384,68 @@ newLabel d
       (_, r) | not (T.null r) -> T.drop 3 r
       _ -> u
 
--- | Build an env, validate it with a @ListBuckets@ probe, and on success run
--- @onOk@ (e.g. persist the profile), record the labelled env and halt.
+-- | Run an attempt with the given CA bundle, validate it with a
+-- @ListBuckets@ probe, and on success run its save step, record the
+-- labelled env and halt.
 --
 -- A 403 / @AccessDenied@ on the probe still counts as connected: the
 -- credentials are valid, they just cannot enumerate buckets, and the main UI
--- lets the user open a bucket by name. Only a genuine failure (bad keys,
--- unreachable endpoint) becomes a message screen.
-attempt :: Text -> IO Env -> IO () -> EventM CName CState ()
-attempt label mkEnv onOk = do
-  r <- liftIO (try mkEnv)
+-- lets the user open a bucket by name.
+--
+-- A certificate failure is not a dead end. It can surface either while
+-- building the env (an unreadable or empty bundle) or from the probe itself
+-- (a server whose chain we do not trust); both route to 'CCaBundle' so the
+-- user can name a trust store and retry. Only a genuine failure — bad keys,
+-- unreachable endpoint — becomes a terminal message.
+runAttempt :: Attempt -> Maybe FilePath -> EventM CName CState ()
+runAttempt at mca = do
+  r <- liftIO (try (atEnv at mca))
   case r of
     Left (e :: SomeException) ->
-      setMsg ("connection failed: " <> oneLine e)
+      let msg = oneLine e
+       in if isCertificateError msg then offerCaBundle at msg else failed msg
     Right env -> do
       chk <- liftIO (checkConnection env)
       case chk of
-        ConnFailed msg -> setMsg ("connection failed: " <> msg)
+        ConnCertError msg -> offerCaBundle at msg
+        ConnFailed msg -> failed msg
         _ -> do
-          liftIO onOk
-          modify (\s -> s { csResult = Just (label, env) })
+          liftIO (atSave at mca)
+          modify (\s -> s { csResult = Just (atLabel at, env) })
           halt
+  where
+    failed msg = setMsg ("connection failed: " <> msg)
+
+-- | Park a certificate-failed attempt and ask for a CA bundle path.
+offerCaBundle :: Attempt -> Text -> EventM CName CState ()
+offerCaBundle at msg =
+  modify $ \s ->
+    s
+      { csScreen = CCaBundle
+      , csPending = Just at
+      , csStatus = msg
+      , csEditor = caEditor (csCaPath s)
+      }
+
+-- | Retry the parked attempt with the bundle the user just typed. An empty
+-- path means \"give up\", which falls back to showing the original error.
+submitCaBundle :: EventM CName CState ()
+submitCaBundle = do
+  st <- get
+  let typed = T.strip (T.concat (E.getEditContents (csEditor st)))
+  case csPending st of
+    Nothing -> toPick
+    Just at
+      | T.null typed -> showPendingError
+      | otherwise -> do
+          path <- liftIO (expandUser (T.unpack typed))
+          modify (\s -> s { csCaPath = typed })
+          runAttempt at (Just path)
+
+-- | Leave the CA prompt, showing the certificate error that opened it.
+showPendingError :: EventM CName CState ()
+showPendingError =
+  modify $ \s -> s { csScreen = CMessage, csPending = Nothing }
 
 setMsg :: Text -> EventM CName CState ()
 setMsg t = modify (\s -> s { csScreen = CMessage, csStatus = t })
@@ -357,6 +490,11 @@ editorFor :: Step -> Draft -> E.Editor Text CName
 editorFor step d =
   E.applyEdit Z.gotoEOF (E.editor CEdit (Just 1) (stepGet step d))
 
+-- | The CA bundle path box, pre-filled with the last path entered.
+caEditor :: Text -> E.Editor Text CName
+caEditor initial =
+  E.applyEdit Z.gotoEOF (E.editor CEdit (Just 1) initial)
+
 draftToParams :: Draft -> ConnParams
 draftToParams d =
   ConnParams
@@ -364,6 +502,8 @@ draftToParams d =
     , cpSecretKey = dSecret d
     , cpRegion = if T.null (dRegion d) then "us-east-1" else dRegion d
     , cpEndpoint = if T.null (dEndpoint d) then Nothing else Just (dEndpoint d)
+    , -- Filled in only if a certificate failure sends us to 'CCaBundle'.
+      cpCaBundle = Nothing
     }
 
 oneLine :: SomeException -> Text

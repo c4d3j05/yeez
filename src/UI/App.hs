@@ -24,10 +24,7 @@ import qualified Data.Vector as V
 import qualified Graphics.Vty as Vty
 import Config (listProfiles)
 import S3.Client
-import System.Directory
-  ( doesDirectoryExist
-  , getHomeDirectory
-  )
+import System.Directory (doesDirectoryExist)
 import System.Exit (exitSuccess)
 import System.FilePath ((</>), takeFileName)
 import UI.Connect (connect)
@@ -49,17 +46,35 @@ runApp = do
   profiles <- listProfiles
   disc <- try newAwsEnv :: IO (Either SomeException Env)
   case (disc, profiles) of
-    (Right env, []) -> runMain [Conn "detected" env]
-    _ -> do
-      mConn <- connect (either (const Nothing) Just disc) profiles
-      case mConn of
-        Nothing -> exitSuccess
-        Just (label, env) -> runMain [Conn label env]
+    (Right env, []) -> do
+      bucketsOrErr <- try (listAllBuckets env)
+      case bucketsOrErr of
+        -- A TLS trust failure is the one startup error the wizard can
+        -- actually fix, by taking a CA bundle path. Silently landing in the
+        -- main UI would report it as "can't list buckets", hiding both the
+        -- real cause and the remedy.
+        Left e | isCertificateError (oneLineExc e) -> runWizard disc profiles
+        _ -> runMainWith [Conn "detected" env] bucketsOrErr
+    _ -> runWizard disc profiles
+
+-- | Show the setup wizard, then run the app with whatever it returns.
+runWizard :: Either SomeException Env -> [Text] -> IO ()
+runWizard disc profiles = do
+  mConn <- connect (either (const Nothing) Just disc) profiles
+  case mConn of
+    Nothing -> exitSuccess
+    Just (label, env) -> runMain [Conn label env]
 
 -- | Load the bucket list into a fresh state and run the main app.
 runMain :: [Conn] -> IO ()
 runMain conns = do
   bucketsOrErr <- try (listAllBuckets (connEnv (head conns)))
+  runMainWith conns bucketsOrErr
+
+-- | 'runMain' with the bucket listing already fetched, so a caller that had
+-- to probe the connection first does not pay for a second @ListBuckets@.
+runMainWith :: [Conn] -> Either SomeException [Text] -> IO ()
+runMainWith conns bucketsOrErr = do
   let st0 = initialState conns
       st = case bucketsOrErr of
         Left (_ :: SomeException) ->
@@ -636,14 +651,6 @@ humanBytes n = go (fromIntegral n :: Double) units
           (i, f) = properFraction r :: (Integer, Double)
        in show i <> "." <> show (round (f * 10) :: Integer)
 
--- | Expand a leading @~/@ to the user's home directory.
-expandUser :: FilePath -> IO FilePath
-expandUser p = case p of
-  '~' : '/' : rest -> do
-    home <- getHomeDirectory
-    pure (home </> rest)
-  _ -> pure p
-
 -- | If the destination is an existing directory, download into it under
 -- the object's own name.
 resolveDest :: FilePath -> Text -> IO FilePath
@@ -651,6 +658,10 @@ resolveDest rawPath name = do
   p <- expandUser rawPath
   isDir <- doesDirectoryExist p
   pure (if isDir then p </> T.unpack name else p)
+
+-- | An exception rendered as a single line of text.
+oneLineExc :: SomeException -> Text
+oneLineExc = T.unwords . T.words . T.pack . displayException
 
 emptyEditor :: E.Editor Text Name
 emptyEditor = E.editor PathEditorW (Just 1) ""

@@ -20,6 +20,9 @@ module UI.Types
   , Conn (..)
   , curEnv
 
+    -- * Paths
+  , expandUser
+
     -- * Application state
   , AppState (..)
   , bucketsL
@@ -33,6 +36,8 @@ import qualified Brick.Widgets.Edit as E
 import qualified Brick.Widgets.List as L
 import Data.Text (Text)
 import Lens.Micro (Lens')
+import System.Directory (getHomeDirectory)
+import System.FilePath ((</>))
 
 -- | Brick widget identifiers. Every focusable widget needs a unique name.
 data Name
@@ -78,6 +83,14 @@ promptLabel a = case a of
   ActNewFolder -> "New folder name"
   ActRename    -> "Rename to"
   ActGoBucket  -> "Open bucket by name"
+
+-- | Expand a leading @~\/@ to the user's home directory.
+expandUser :: FilePath -> IO FilePath
+expandUser p = case p of
+  '~' : '/' : rest -> do
+    home <- getHomeDirectory
+    pure (home </> rest)
+  _ -> pure p
 
 -- | One row of the object list.
 --
