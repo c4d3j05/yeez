@@ -675,6 +675,6 @@ theMap =
     , (E.editFocusedAttr, Vty.black `on` Vty.white)
     , (titleAttr, Vty.white `on` Vty.blue)
     , (statusAttr, fg Vty.yellow)
-    , (helpAttr, fg Vty.brightBlack)
+    , (helpAttr, fg Vty.cyan)
     , (folderAttr, fg Vty.brightBlue)
     ]
