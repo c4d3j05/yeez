@@ -31,11 +31,12 @@ class Yeez < Formula
 
   # ---------------------------------------------------------------------------
   # Build from source: used by `brew install --HEAD` (and the only option on
-  # Intel). Compiles the full amazonka tree, so the first build is slow.
+  # Intel). Compiles the full amazonka tree, so the first build is slow. The
+  # ghc/cabal build deps live inside the head block so they are only pulled in
+  # for a source build, never for the prebuilt-binary path.
   # ---------------------------------------------------------------------------
-  head "https://github.com/c4d3j05/yeez.git", branch: "main"
-
-  on_head do
+  head do
+    url "https://github.com/c4d3j05/yeez.git", branch: "main"
     depends_on "cabal-install" => :build
     depends_on "ghc" => :build
   end
