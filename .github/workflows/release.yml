@@ -118,10 +118,21 @@ jobs:
           git commit -m "Release v$VER: bump version and Homebrew formula"
           git push -f origin "$BR"
           BODY="Automated release bump for v$VER. yeez.cabal -> $VER; Formula/yeez.rb version -> $VER, sha256 $SHA. The v$VER tag, GitHub Release (binary attached) and GHCR image are already published; merge this PR so brew serves the new binary."
-          gh pr create --base main --head "$BR" \
-            --title "Release v$VER: bump version + formula" \
-            --body "$BODY" \
-            || echo "A PR for $BR may already exist; its branch was updated."
+          # Never mask a failed `gh pr create`. If the bump PR is neither
+          # opened nor already open, nothing ever merges the new sha256 into
+          # main, and `brew install` fails the checksum check against the
+          # freshly published binary -- with the release job still green.
+          if [ "$(gh pr list --head "$BR" --state open --json number --jq 'length')" != "0" ]; then
+            echo "A PR for $BR is already open; its branch was updated."
+          else
+            gh pr create --base main --head "$BR" \
+              --title "Release v$VER: bump version + formula" \
+              --body "$BODY" \
+              || {
+                echo "::error::Could not open the bump PR for $BR. v$VER is published but main still carries the previous sha256, so \`brew install\` will fail the checksum check until $BR is merged."
+                exit 1
+              }
+          fi
 
   # Publish the Docker image to GHCR, tagged with the version and :latest,
   # built from the tag the release job just created.
