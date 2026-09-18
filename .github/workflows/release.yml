@@ -24,6 +24,7 @@ on:
 
 permissions:
   contents: write # commit the bump, move the tag, publish the release
+  packages: write # push the Docker image to GHCR
 
 # Never let two releases run at once.
 concurrency:
@@ -110,3 +111,34 @@ jobs:
           name: yeez ${{ steps.v.outputs.version }}
           files: dist/yeez-macos-arm64
           fail_on_unmatched_files: true
+
+  # Publish the Docker image to GHCR, tagged with the version and :latest,
+  # built from the tag the release job just created.
+  docker:
+    name: Docker image (GHCR)
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v${{ github.event.inputs.version }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ github.event.inputs.version }}
+            ghcr.io/${{ github.repository }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
