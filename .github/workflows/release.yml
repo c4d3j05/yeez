@@ -1,19 +1,22 @@
 name: release
 
-# Cut a release straight from the Actions tab:
+# Cut a release from the Actions tab:
 #   Actions ▸ release ▸ Run workflow ▸ version: 0.1.0
 #
-# One dispatch does the whole thing, self-contained (no cross-workflow tag
-# trigger, which the default GITHUB_TOKEN would suppress anyway):
+# `main` is a protected branch (PR-only), so the release never pushes to it
+# directly. Instead one dispatch:
 #
-#   1. bump the version in yeez.cabal and Formula/yeez.rb
-#   2. build the Apple Silicon binary
-#   3. commit the bump to main and (force-)tag vX.Y.Z
-#   4. update the Homebrew formula's sha256 to the freshly built binary
-#   5. publish/refresh the GitHub Release with the binary attached
+#   1. builds the Apple Silicon binary from main
+#   2. tags vX.Y.Z and publishes the GitHub Release with the binary attached
+#   3. pushes the Docker image to GHCR (:X.Y.Z and :latest)
+#   4. opens a PR that bumps yeez.cabal + Formula/yeez.rb (version + sha256)
 #
-# Re-running with a version that already exists re-releases it (the tag is
-# moved and the release updated), so this is also how you "push 0.1.0 again".
+# Tags, releases and packages are not branch-protected, so 1–3 happen straight
+# away. Only the repo-file bump goes through review — merging that PR is what
+# makes `brew` serve the new binary.
+#
+# Re-dispatching an existing version re-releases it (tag moved, release & image
+# refreshed, the bump PR branch updated).
 
 on:
   workflow_dispatch:
@@ -23,10 +26,10 @@ on:
         required: true
 
 permissions:
-  contents: write # commit the bump, move the tag, publish the release
+  contents: write # create the tag + GitHub Release, push the bump branch
   packages: write # push the Docker image to GHCR
+  pull-requests: write # open the version-bump PR
 
-# Never let two releases run at once.
 concurrency:
   group: release
   cancel-in-progress: false
@@ -66,12 +69,6 @@ jobs:
           key: release-arm64-ghc9.4.8-${{ hashFiles('**/*.cabal') }}
           restore-keys: release-arm64-ghc9.4.8-
 
-      - name: Bump version in yeez.cabal
-        run: |
-          VER="${{ steps.v.outputs.version }}"
-          sed -i '' -E "s/^version:([[:space:]]+).*/version:\1$VER/" yeez.cabal
-          grep '^version:' yeez.cabal
-
       - name: Build binary
         run: |
           cabal update
@@ -85,23 +82,12 @@ jobs:
         id: sum
         run: echo "sha256=$(shasum -a 256 dist/yeez-macos-arm64 | awk '{print $1}')" >> "$GITHUB_OUTPUT"
 
-      - name: Update Homebrew formula
-        run: |
-          VER="${{ steps.v.outputs.version }}"
-          SHA="${{ steps.sum.outputs.sha256 }}"
-          sed -i '' -E "s/version \"[0-9.]+\"/version \"$VER\"/" Formula/yeez.rb
-          sed -i '' -E "s#download/v[0-9.]+/#download/v$VER/#g" Formula/yeez.rb
-          sed -i '' -E "s/sha256 \"[a-f0-9]{64}\"/sha256 \"$SHA\"/" Formula/yeez.rb
-
-      - name: Commit bump + formula, move tag
+      - name: Tag release
         run: |
           VER="${{ steps.v.outputs.version }}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add yeez.cabal Formula/yeez.rb
-          git commit -m "Release v$VER" || echo "no version change to commit"
           git tag -f -a "v$VER" -m "yeez $VER"
-          git push origin main
           git push -f origin "v$VER"
 
       - name: Publish GitHub Release
@@ -111,6 +97,35 @@ jobs:
           name: yeez ${{ steps.v.outputs.version }}
           files: dist/yeez-macos-arm64
           fail_on_unmatched_files: true
+
+      - name: Open version-bump PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VER="${{ steps.v.outputs.version }}"
+          SHA="${{ steps.sum.outputs.sha256 }}"
+          sed -i '' -E "s/^version:([[:space:]]+).*/version:\1$VER/" yeez.cabal
+          sed -i '' -E "s/version \"[0-9.]+\"/version \"$VER\"/" Formula/yeez.rb
+          sed -i '' -E "s#download/v[0-9.]+/#download/v$VER/#g" Formula/yeez.rb
+          sed -i '' -E "s/sha256 \"[a-f0-9]{64}\"/sha256 \"$SHA\"/" Formula/yeez.rb
+          if git diff --quiet -- yeez.cabal Formula/yeez.rb; then
+            echo "No version/formula changes needed."
+            exit 0
+          fi
+          BR="release-bump/v$VER"
+          git checkout -b "$BR"
+          git add yeez.cabal Formula/yeez.rb
+          git commit -m "Release v$VER: bump version and Homebrew formula"
+          git push -f origin "$BR"
+          gh pr create --base main --head "$BR" \
+            --title "Release v$VER: bump version + formula" \
+            --body "Automated by the release workflow for **v$VER**.
+
+- \`yeez.cabal\` version → $VER
+- \`Formula/yeez.rb\` version → $VER, sha256 → \`$SHA\`
+
+The v$VER tag, GitHub Release (binary attached) and GHCR image are already published. Merge this PR so \`brew\` serves the new binary." \
+            || echo "A PR for $BR may already exist; its branch was updated."
 
   # Publish the Docker image to GHCR, tagged with the version and :latest,
   # built from the tag the release job just created.
