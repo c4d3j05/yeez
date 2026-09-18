@@ -117,14 +117,10 @@ jobs:
           git add yeez.cabal Formula/yeez.rb
           git commit -m "Release v$VER: bump version and Homebrew formula"
           git push -f origin "$BR"
+          BODY="Automated release bump for v$VER. yeez.cabal -> $VER; Formula/yeez.rb version -> $VER, sha256 $SHA. The v$VER tag, GitHub Release (binary attached) and GHCR image are already published; merge this PR so brew serves the new binary."
           gh pr create --base main --head "$BR" \
             --title "Release v$VER: bump version + formula" \
-            --body "Automated by the release workflow for **v$VER**.
-
-- \`yeez.cabal\` version → $VER
-- \`Formula/yeez.rb\` version → $VER, sha256 → \`$SHA\`
-
-The v$VER tag, GitHub Release (binary attached) and GHCR image are already published. Merge this PR so \`brew\` serves the new binary." \
+            --body "$BODY" \
             || echo "A PR for $BR may already exist; its branch was updated."
 
   # Publish the Docker image to GHCR, tagged with the version and :latest,
