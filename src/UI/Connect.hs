@@ -39,7 +39,13 @@ import qualified Data.Text.Zipper as Z
 import qualified Data.Vector as V
 import qualified Graphics.Vty as Vty
 import Lens.Micro (Lens')
-import S3.Client (ConnParams (..), listAllBuckets, newAwsEnv, newAwsEnvFromParams)
+import S3.Client
+  ( ConnCheck (..)
+  , ConnParams (..)
+  , checkConnection
+  , newAwsEnv
+  , newAwsEnvFromParams
+  )
 import System.Environment (setEnv)
 
 -- ---------------------------------------------------------------------------
@@ -286,19 +292,27 @@ newLabel d
       (_, r) | not (T.null r) -> T.drop 3 r
       _ -> u
 
--- | Build an env, validate it with a @ListBuckets@ call, and on success run
--- @onOk@ (e.g. persist the profile), record the labelled env and halt. Any
--- failure becomes a message screen.
+-- | Build an env, validate it with a @ListBuckets@ probe, and on success run
+-- @onOk@ (e.g. persist the profile), record the labelled env and halt.
+--
+-- A 403 / @AccessDenied@ on the probe still counts as connected: the
+-- credentials are valid, they just cannot enumerate buckets, and the main UI
+-- lets the user open a bucket by name. Only a genuine failure (bad keys,
+-- unreachable endpoint) becomes a message screen.
 attempt :: Text -> IO Env -> IO () -> EventM CName CState ()
 attempt label mkEnv onOk = do
-  r <- liftIO (try (mkEnv >>= \e -> listAllBuckets e >> pure e))
+  r <- liftIO (try mkEnv)
   case r of
     Left (e :: SomeException) ->
       setMsg ("connection failed: " <> oneLine e)
     Right env -> do
-      liftIO onOk
-      modify (\s -> s { csResult = Just (label, env) })
-      halt
+      chk <- liftIO (checkConnection env)
+      case chk of
+        ConnFailed msg -> setMsg ("connection failed: " <> msg)
+        _ -> do
+          liftIO onOk
+          modify (\s -> s { csResult = Just (label, env) })
+          halt
 
 setMsg :: Text -> EventM CName CState ()
 setMsg t = modify (\s -> s { csScreen = CMessage, csStatus = t })

@@ -48,6 +48,8 @@ data PendingAction
   | ActDownload
   | ActNewFolder
   | ActRename
+  | ActGoBucket
+    -- ^ Open a bucket by name, for credentials that cannot list buckets.
   deriving (Eq, Show)
 
 -- | The five screens of the app. The whole UI is a state machine over these.
@@ -75,6 +77,7 @@ promptLabel a = case a of
   ActDownload  -> "Download — local destination path"
   ActNewFolder -> "New folder name"
   ActRename    -> "Rename to"
+  ActGoBucket  -> "Open bucket by name"
 
 -- | One row of the object list.
 --

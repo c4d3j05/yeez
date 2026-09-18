@@ -62,10 +62,13 @@ runMain conns = do
   bucketsOrErr <- try (listAllBuckets (connEnv (head conns)))
   let st0 = initialState conns
       st = case bucketsOrErr of
-        Left (e :: SomeException) ->
+        Left (_ :: SomeException) ->
+          -- Can't enumerate buckets (typically a bucket-scoped policy that
+          -- lacks s3:ListAllMyBuckets). The connection is still usable: land
+          -- on an empty bucket list and point the user at "open by name".
           st0
-            { stStatus = "error listing buckets: " <> oneLine e
-            , stScreen = ScreenMessage ScreenBuckets
+            { stStatus = "can't list buckets — press g to open one by name"
+            , stScreen = ScreenBuckets
             }
         Right bs ->
           st0
@@ -156,7 +159,7 @@ bucketsScreen st =
     , B.hBorder
     , L.renderList renderBucket True (stBuckets st)
     , B.hBorder
-    , footer st "↑/↓ move · enter open · r refresh · c connections · ? all commands · esc/q quit"
+    , footer st "↑/↓ move · enter open · g open by name · r refresh · c connections · ? all commands · esc/q quit"
     ]
 
 renderBucket :: Bool -> Text -> Widget Name
@@ -242,6 +245,7 @@ helpOverlay =
       [ withAttr folderAttr (txt "Navigation")
       , txt "  ↑/↓        move selection"
       , txt "  enter      open bucket / folder / file"
+      , txt "  g          open a bucket by name (for scoped access)"
       , txt "  esc / h    go back (quit from the bucket list)"
       , txt "  r          refresh the current listing"
       , txt "  q          quit"
@@ -290,6 +294,7 @@ bucketsEvent = \case
   Vty.EvKey Vty.KEsc [] -> halt
   Vty.EvKey (Vty.KChar 'r') [] -> refreshBuckets
   Vty.EvKey (Vty.KChar 'c') [] -> openConnections
+  Vty.EvKey (Vty.KChar 'g') [] -> startPrompt ActGoBucket ""
   Vty.EvKey (Vty.KChar '?') [] -> openHelp
   Vty.EvKey Vty.KEnter [] -> openSelectedBucket
   ev -> zoom bucketsL (L.handleListEvent ev)
@@ -419,7 +424,8 @@ addConnection = do
 
 promptEvent :: PendingAction -> BrickEvent Name e -> EventM Name AppState ()
 promptEvent act be = case be of
-  VtyEvent (Vty.EvKey Vty.KEsc []) -> modify (\s -> s { stScreen = ScreenObjects })
+  VtyEvent (Vty.EvKey Vty.KEsc []) ->
+    modify (\s -> s { stScreen = if stBucket s == Nothing then ScreenBuckets else ScreenObjects })
   VtyEvent (Vty.EvKey Vty.KEnter []) -> submitPrompt act
   _ -> zoom editorL (E.handleEditorEvent be)
 
@@ -433,6 +439,20 @@ startPrompt act initial =
       }
 
 submitPrompt :: PendingAction -> EventM Name AppState ()
+submitPrompt ActGoBucket = do
+  st <- get
+  let input = T.strip (T.concat (E.getEditContents (stEditor st)))
+      -- Accept "bucket", "s3://bucket" or "bucket/some/prefix"; the first
+      -- path segment is the bucket, the rest becomes the opening prefix.
+      noScheme = fromMaybe input (T.stripPrefix "s3://" input)
+      (bucketRaw, rest) = T.breakOn "/" noScheme
+      bucket = stripSlashes bucketRaw
+      prefix = let p = stripSlashes rest in if T.null p then "" else p <> "/"
+  if T.null bucket
+    then modify (\s -> s { stScreen = ScreenBuckets })
+    else do
+      modify (\s -> s { stBucket = Just bucket, stPrefix = prefix, stScreen = ScreenObjects })
+      refreshObjects
 submitPrompt act = do
   st <- get
   let input = T.strip (T.concat (E.getEditContents (stEditor st)))

@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 -- | The only module in yeez that talks to amazonka.
 --
@@ -15,6 +16,8 @@ module S3.Client
   , newAwsEnv
   , newAwsEnvFromParams
   , listAllBuckets
+  , ConnCheck (..)
+  , checkConnection
   , listObjectsUnder
   , uploadFile
   , downloadFile
@@ -28,6 +31,7 @@ import Amazonka (Env)
 import qualified Amazonka.Auth as Auth
 import qualified Amazonka.S3 as S3
 import qualified Amazonka.S3.Lens as S3L
+import Control.Exception (SomeException, displayException, try)
 import Control.Monad (void)
 import Control.Monad.Trans.Resource (runResourceT)
 import qualified Data.ByteString as BS
@@ -108,6 +112,42 @@ listAllBuckets env = runResourceT $ do
     [ S3.fromBucketName (b ^. S3L.bucket_name)
     | b <- fromMaybe [] (rs ^. S3L.listBucketsResponse_buckets)
     ]
+
+-- | The outcome of probing a connection with a @ListBuckets@ call.
+data ConnCheck
+  = ConnOK
+    -- ^ Credentials valid and buckets are listable.
+  | ConnDenied
+    -- ^ Credentials valid, but @ListBuckets@ is forbidden (a 403 /
+    -- @AccessDenied@). This is the normal shape of a bucket-scoped IAM
+    -- policy: the connection works, it just cannot enumerate buckets, so the
+    -- user must open a bucket by name.
+  | ConnFailed Text
+    -- ^ Anything else — bad keys, wrong endpoint, network error, …. The text
+    -- is a one-line, human-readable summary.
+  deriving (Eq, Show)
+
+-- | Probe @env@ with a @ListBuckets@ call and classify the result.
+--
+-- A 403 / @AccessDenied@ is deliberately treated as a working connection
+-- ('ConnDenied') rather than a failure: reaching @AccessDenied@ means AWS
+-- authenticated the request and only authorization was refused, so the
+-- credentials themselves are good. We match on the S3 error code
+-- (@AccessDenied@) and HTTP status (@403@) in the rendered error rather than
+-- amazonka's shifting record/lens names.
+checkConnection :: Env -> IO ConnCheck
+checkConnection env = do
+  r <- try (listAllBuckets env)
+  pure $ case r of
+    Right _ -> ConnOK
+    Left (e :: SomeException) ->
+      let msg = T.pack (displayException e)
+       in if isDenied msg then ConnDenied else ConnFailed (oneLine msg)
+  where
+    isDenied m =
+      "AccessDenied" `T.isInfixOf` m
+        || "statusCode = 403" `T.isInfixOf` m
+    oneLine = T.unwords . T.words
 
 -- | List one "directory level" of a bucket: everything directly under
 -- @prefix@, with @\/@ as the delimiter.

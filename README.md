@@ -63,6 +63,7 @@ use.
 |-------------|--------------------|-----------------------------------------------------|
 | `↑` / `↓`   | list screens       | move selection                                      |
 | `Enter`     | bucket/object list | open selected bucket/folder                         |
+| `g`         | bucket list        | open a bucket by name (for bucket-scoped access)    |
 | `Esc` / `h` | object list        | go up one level (or back to bucket list)            |
 | `u`         | object list        | prompt for a local path, upload into current folder |
 | `d`         | object list        | prompt for local destination, download selected file |
@@ -97,6 +98,28 @@ Press `c` on the bucket or object list to open the connection switcher:
 
 The active connection is marked with `●`. At startup the first connection is
 whatever the setup wizard (or the ambient credential chain) established.
+
+## Bucket-scoped credentials
+
+Some IAM policies grant access to specific buckets but withhold the
+account-wide `s3:ListAllMyBuckets` action. With such credentials the opening
+bucket list can't be built, and older behaviour was to treat that as a
+connection failure:
+
+```
+connection failed: ... not authorized to perform: s3:ListAllMyBuckets ...
+```
+
+yeez now recognises this: a `403` / `AccessDenied` on the bucket-list probe
+means the credentials are valid but simply can't enumerate buckets, so the
+connection still opens. The bucket list is empty, and the status bar prompts
+you to press `g` to **open a bucket by name**. Type `my-bucket` (or
+`s3://my-bucket/some/prefix`) and yeez browses it directly via
+`ListObjectsV2`. If that bucket is also denied, the error is shown and you can
+press `g` to try another.
+
+To grant full listing instead, attach a policy allowing `s3:ListAllMyBuckets`
+on `*`.
 
 ## Screens
 
