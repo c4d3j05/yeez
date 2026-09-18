@@ -4,36 +4,34 @@ class Yeez < Formula
   license "BSD-3-Clause"
 
   # ---------------------------------------------------------------------------
-  # Prebuilt binary from a GitHub Release (fast path).
+  # Prebuilt binary from a GitHub Release (fast path). Apple Silicon only.
   #
-  # The `build` CI workflow attaches yeez-macos-arm64 / yeez-macos-x86_64 to
-  # the release for each v* tag. Bump the version, then fill in the two
-  # sha256 values printed by:
+  # The `build` CI workflow attaches yeez-macos-arm64 to the release for each
+  # v* tag. After a new release, refresh the sha256 with:
   #
   #   VER=0.1.0
-  #   for a in arm64 x86_64; do
-  #     curl -fsSL -o /tmp/yeez-$a \
-  #       "https://github.com/c4d3j05/yeez/releases/download/v$VER/yeez-macos-$a"
-  #     shasum -a 256 /tmp/yeez-$a
-  #   done
+  #   curl -fsSL -o /tmp/yeez-arm64 \
+  #     "https://github.com/c4d3j05/yeez/releases/download/v$VER/yeez-macos-arm64"
+  #   shasum -a 256 /tmp/yeez-arm64
   # ---------------------------------------------------------------------------
   version "0.1.0"
 
   on_macos do
     on_arm do
       url "https://github.com/c4d3j05/yeez/releases/download/v0.1.0/yeez-macos-arm64"
-      sha256 "REPLACE_WITH_ARM64_SHA256"
+      sha256 "7aa0f2a044d70942698dc85417f6685c44e2c968a64de937ad846b4bc06f2745"
     end
     on_intel do
-      url "https://github.com/c4d3j05/yeez/releases/download/v0.1.0/yeez-macos-x86_64"
-      sha256 "REPLACE_WITH_X86_64_SHA256"
+      # No prebuilt Intel binary is published. Build from source instead:
+      #   brew install --HEAD c4d3j05/tap/yeez
+      odie "yeez ships a prebuilt binary for Apple Silicon only; " \
+           "install from source with `brew install --HEAD`."
     end
   end
 
   # ---------------------------------------------------------------------------
-  # Build from source: used by `brew install --HEAD` and as a fallback when the
-  # release binaries are unavailable. Compiles the full amazonka tree, so the
-  # first build is slow.
+  # Build from source: used by `brew install --HEAD` (and the only option on
+  # Intel). Compiles the full amazonka tree, so the first build is slow.
   # ---------------------------------------------------------------------------
   head "https://github.com/c4d3j05/yeez.git", branch: "main"
 
