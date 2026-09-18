@@ -145,11 +145,14 @@ header st t =
 activeLabel :: AppState -> Text
 activeLabel st = maybe "?" connLabel (safeIx (stConns st) (stConnIx st))
 
+-- | The bottom bar: a status line plus the shortcut hints. The hints use
+-- 'txtWrap' so a long list wraps onto extra rows rather than being clipped at
+-- the right edge on a narrow terminal (the full reference is always under @?@).
 footer :: AppState -> Text -> Widget Name
 footer st keys =
   vBox
     [ withAttr statusAttr (padRight Max (txt (" " <> stStatus st)))
-    , withAttr helpAttr (padRight Max (txt (" " <> keys)))
+    , withAttr helpAttr (txtWrap (" " <> keys))
     ]
 
 bucketsScreen :: AppState -> Widget Name
