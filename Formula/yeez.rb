@@ -14,12 +14,12 @@ class Yeez < Formula
   #     "https://github.com/c4d3j05/yeez/releases/download/v$VER/yeez-macos-arm64"
   #   shasum -a 256 /tmp/yeez-arm64
   # ---------------------------------------------------------------------------
-  version "0.1.1"
+  version "0.1.2"
 
   on_macos do
     on_arm do
-      url "https://github.com/c4d3j05/yeez/releases/download/v0.1.1/yeez-macos-arm64"
-      sha256 "acf232880cb081ebaf8aa3a8947c0b51dadccea2ce90e40098209abd9b96eb2a"
+      url "https://github.com/c4d3j05/yeez/releases/download/v0.1.2/yeez-macos-arm64"
+      sha256 "5bd04ef0f43021669faeab0fc148eabafab906f5252edfbda44cd784e22d9e87"
     end
     on_intel do
       # No prebuilt Intel binary is published. Build from source instead:
